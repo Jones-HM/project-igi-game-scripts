@@ -9,95 +9,197 @@ Start/Exit key = 'END'
 Written by IGI-ResearchDevs - HM.--]]*/
 
 #include "GTLibc.hpp"
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <chrono>
+
 using namespace GTLIBC;
 
-// Game details
-#define GAME_NAME "igi"
+#define GAME_PROCESS "igi"
+#define CAMERA_COPY_OFFSET  0x00097E82   // IGI.exe + 97E82
 
-// Memory addresses
-#define VIEWPORT_TASK 0x00497E94
-#define VIEWPORT_ADDR 0x00BCAAE0
-#define CAMERA_ADDR 0x00684138
-#define VIEWPORT_X 0x00BCAB08
-#define VIEWPORT_Y VIEWPORT_X + 8
-#define VIEWPORT_Z VIEWPORT_X + 16
-#define VIEWPORT_SIZE 9
-#define FLOAT_SIZE 4
-#define HUMAN_VIEW_BASE 0x0056E210
-#define HUMAN_VIEW_OFFSETS {0x08, 0x7CC, 0x14, 0x4F0}
+#define VIEWPORT_X  0x00BCAB08
+#define VIEWPORT_Y  (VIEWPORT_X + 8)
+#define VIEWPORT_Z  (VIEWPORT_X + 16)
 
-// Function to recalibrate viewport
-void RecalibrateViewPort(GTLibc &gtlibc) {
-    DWORD humanViewAddress = gtlibc.ReadPointerOffsets<DWORD>(HUMAN_VIEW_BASE, HUMAN_VIEW_OFFSETS);
-    gtlibc.WriteFloat(humanViewAddress + 0xF3C, 0.0);
-    gtlibc.WriteFloat(humanViewAddress + 0x50C, 3.095987082);
-}
+#define PLAYER_BASE_OFFSET 0x0016E210
 
-int main() {
-    GTLibc gtlibc(true);
+class IGIFreeCamera
+{
+public:
+    IGIFreeCamera() : gameLib(true) {}
 
-    // Find the game process
-    HANDLE gameHandle = gtlibc.FindGameProcess(GAME_NAME);
-    if (gameHandle == NULL) {
-        std::cout << "Game process not found." << std::endl;
-        return 1;
+    bool Initialize()
+    {
+        std::cout << "[INFO] Attaching to IGI...\n";
+
+        if (!gameLib.FindGameProcess(GAME_PROCESS))
+        {
+            std::cout << "[ERROR] Game process not found.\n";
+            return false;
+        }
+
+        gameBaseAddress = gameLib.GetGameBaseAddress();
+        std::cout << "[INFO] Base Address: 0x"
+                  << std::hex << gameBaseAddress << std::dec << "\n";
+
+        PatchCameraCopy();
+        EnableThirdPerson();
+
+        return true;
     }
 
-    // Deattach viewport of camera
-    gtlibc.WriteBytes(VIEWPORT_TASK, {0x90, 0x90});
+    void Run()
+    {
+        std::cout << "[INFO] FreeCam running. Press HOME to exit.\n";
 
-    // Change human 3rd view
-    DWORD humanViewAddress = gtlibc.ReadPointerOffsets<DWORD>(HUMAN_VIEW_BASE, HUMAN_VIEW_OFFSETS);
-    gtlibc.WriteInteger(humanViewAddress, 3);
-
-    // Main loop for key events
-    while (!gtlibc.IsKeyPressed(VK_END)) {
-        double vport_x = gtlibc.ReadDouble(VIEWPORT_X);
-        double vport_y = gtlibc.ReadDouble(VIEWPORT_Y);
-        double vport_z = gtlibc.ReadDouble(VIEWPORT_Z);
-        double vport_off = 5.5; // Offset value to move this amount from axis
-
-        // This loop allows us to move, rotate, zoom around freeroam camera
-        for (int index = 0; index <= VIEWPORT_SIZE * FLOAT_SIZE; index += FLOAT_SIZE) {
-            float camera_prop = gtlibc.ReadFloat(CAMERA_ADDR + index);
-            gtlibc.WriteFloat(VIEWPORT_ADDR + index, camera_prop);
+        while (!gameLib.IsKeyPressed(VK_HOME))
+        {
+            UpdateCamera();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        // Key events for X-axis
-        if (gtlibc.IsKeyPressed(VK_RIGHT)) {
-            gtlibc.WriteDouble(VIEWPORT_X, vport_x - vport_off);
-        }
-        if (gtlibc.IsKeyPressed(VK_LEFT)) {
-            gtlibc.WriteDouble(VIEWPORT_X, vport_x + vport_off);
-        }
-
-        // Key events for Y-axis
-        if (gtlibc.IsKeyPressed(VK_UP)) {
-            gtlibc.WriteDouble(VIEWPORT_Y, vport_y - vport_off);
-        }
-        if (gtlibc.IsKeyPressed(VK_DOWN)) {
-            gtlibc.WriteDouble(VIEWPORT_Y, vport_y + vport_off);
-        }
-
-        // Key events for Z-axis
-        if (gtlibc.IsKeyPressed(VK_SPACE)) {
-            gtlibc.WriteDouble(VIEWPORT_Z, vport_z + vport_off);
-        }
-        if (gtlibc.IsKeyPressed(VK_MENU)) {
-            gtlibc.WriteDouble(VIEWPORT_Z, vport_z - vport_off);
-        }
-
-        // Key event for recalibrate view
-        if (gtlibc.IsKeyPressed(VK_BACK)) {
-            RecalibrateViewPort(gtlibc);
-        }
+        Restore();
+        std::cout << "[INFO] FreeCam exited cleanly.\n";
     }
 
-    // Attach viewport of camera
-    gtlibc.WriteBytes(VIEWPORT_TASK, {0xF3, 0xA5});
+private:
+    GTLibc gameLib;
+    DWORD gameBaseAddress{};
+    std::vector<BYTE> originalBytes;
+    const double movementOffset = 1000.0;
 
-    // Reset human view
-    gtlibc.WriteInteger(humanViewAddress, 1);
+private:
+
+    // ===============================
+    // Patch mov ecx,42 → mov ecx,9
+    // ===============================
+    void PatchCameraCopy()
+    {
+        DWORD patchAddress = gameBaseAddress + CAMERA_COPY_OFFSET;
+
+        originalBytes.clear();
+
+        std::cout << "[DEBUG] Original Bytes: ";
+        for (int i = 0; i < 5; ++i)
+        {
+            BYTE byte = gameLib.ReadAddress<BYTE>(patchAddress + i);
+            originalBytes.push_back(byte);
+            std::cout << std::hex << (int)byte << " ";
+        }
+        std::cout << std::dec << "\n";
+
+        // Expected original: B9 2A 00 00 00
+
+        BYTE patch[5] = { 0xB9, 0x09, 0x00, 0x00, 0x00 };
+
+        for (int i = 0; i < 5; ++i)
+        {
+            gameLib.WriteAddress<BYTE>(patchAddress + i, patch[i]);
+        }
+
+        std::cout << "[INFO] Camera copy patched (ECX=9).\n";
+    }
+
+    void RestoreCameraCopy()
+    {
+        DWORD patchAddress = gameBaseAddress + CAMERA_COPY_OFFSET;
+
+        if (originalBytes.size() != 5)
+            return;
+
+        for (int i = 0; i < 5; ++i)
+        {
+            gameLib.WriteAddress<BYTE>(patchAddress + i, originalBytes[i]);
+        }
+
+        std::cout << "[INFO] Camera copy restored.\n";
+    }
+
+    // ===============================
+    // Player Base
+    // ===============================
+    DWORD GetPlayerBase()
+    {
+        DWORD basePtr =
+            gameLib.ReadAddress<DWORD>(gameBaseAddress + PLAYER_BASE_OFFSET);
+
+        if (!basePtr)
+            return 0;
+
+        return gameLib.ReadPointerOffsets<DWORD>(basePtr, { 0x8, 0x7CC, 0x14 });
+    }
+
+    void EnableThirdPerson()
+    {
+        DWORD playerBase = GetPlayerBase();
+        if (!playerBase) return;
+
+        gameLib.WriteAddress<int>(playerBase + 0x4F0, 3);
+    }
+
+    void DisableThirdPerson()
+    {
+        DWORD playerBase = GetPlayerBase();
+        if (!playerBase) return;
+
+        gameLib.WriteAddress<int>(playerBase + 0x4F0, 1);
+    }
+
+    // ===============================
+    // Movement (Same as Lua)
+    // ===============================
+    void UpdateCamera()
+    {
+        double x = gameLib.ReadAddress<double>(VIEWPORT_X);
+        double y = gameLib.ReadAddress<double>(VIEWPORT_Y);
+        double z = gameLib.ReadAddress<double>(VIEWPORT_Z);
+
+        if (gameLib.IsKeyPressed(VK_RIGHT))
+            gameLib.WriteAddress<double>(VIEWPORT_X, x + movementOffset);
+
+        if (gameLib.IsKeyPressed(VK_LEFT))
+            gameLib.WriteAddress<double>(VIEWPORT_X, x - movementOffset);
+
+        if (gameLib.IsKeyPressed(VK_UP))
+            gameLib.WriteAddress<double>(VIEWPORT_Y, y + movementOffset);
+
+        if (gameLib.IsKeyPressed(VK_DOWN))
+            gameLib.WriteAddress<double>(VIEWPORT_Y, y - movementOffset);
+
+        if (gameLib.IsKeyPressed(VK_SPACE))
+            gameLib.WriteAddress<double>(VIEWPORT_Z, z + movementOffset);
+
+        if (gameLib.IsKeyPressed(VK_MENU))
+            gameLib.WriteAddress<double>(VIEWPORT_Z, z - movementOffset);
+    }
+
+    // ===============================
+    // Cleanup
+    // ===============================
+    void Restore()
+    {
+        RestoreCameraCopy();
+        DisableThirdPerson();
+    }
+};
+
+int main()
+{
+    try
+    {
+        IGIFreeCamera freecam;
+
+        if (!freecam.Initialize())
+            return 0;
+
+        freecam.Run();
+    }
+    catch (const std::exception& ex)
+    {
+        std::cerr << ex.what() << "\n";
+    }
 
     return 0;
 }
